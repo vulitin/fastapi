@@ -15,9 +15,8 @@ class Complaint(BaseModel):
 class SentimentAnalysisResult(BaseModel):
     complaint_id: int
     text: str
-    sentiment: str
-    confidence: float
     timestamp: str
+    sentiment: str
 
 # Конфигурация
 API_LAYER_URL = "https://api.apilayer.com/sentiment/analysis"
@@ -34,8 +33,7 @@ def init_db():
             text TEXT NOT NULL,
             status TEXT DEFAULT OPEN,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            sentiment TEXT NOT NULL,
-            confidence REAL NOT NULL
+            sentiment TEXT NOT NULL
         )
         """)
         conn.commit()
@@ -51,12 +49,12 @@ def analyze_sentiment(text: str) -> dict:
         raise HTTPException(status_code=500, detail=f"Sentiment analysis API error: {str(e)}")
 
 # Сохранение жалобы в базу данных
-def save_complaint(text: str, sentiment: str, confidence: float) -> int:
+def save_complaint(text: str, sentiment: str) -> int:
     with sqlite3.connect(DATABASE_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO complaints (text, sentiment, confidence) VALUES (?, ?, ?)",
-            (text, sentiment, confidence)
+            "INSERT INTO complaints (text, sentiment) VALUES (?, ?)",
+            (text, sentiment)
         )
         conn.commit()
         return cursor.lastrowid
@@ -66,7 +64,7 @@ def get_complaint(complaint_id: int) -> dict:
     with sqlite3.connect(DATABASE_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, text, sentiment, confidence, timestamp FROM complaints WHERE id = ?",
+            "SELECT id, text, sentiment, timestamp FROM complaints WHERE id = ?",
             (complaint_id,)
         )
         result = cursor.fetchone()
@@ -76,8 +74,7 @@ def get_complaint(complaint_id: int) -> dict:
             "complaint_id": result[0],
             "text": result[1],
             "sentiment": result[2],
-            "confidence": result[3],
-            "timestamp": result[4]
+            "timestamp": result[3]
         }
 
 @app.on_event("startup")
@@ -90,7 +87,7 @@ async def analyze_complaint(complaint: Complaint):
     analysis_result = analyze_sentiment(complaint.text)
     
     # Проверка наличия ожидаемых полей в ответе
-    if not all(key in analysis_result for key in ["sentiment", "confidence"]):
+    if not all(key in analysis_result for key in ["sentiment"]):
         raise HTTPException(
             status_code=500,
             detail="Unexpected response from sentiment analysis API"
@@ -99,8 +96,7 @@ async def analyze_complaint(complaint: Complaint):
     # Сохранение в базу данных
     complaint_id = save_complaint(
         text=complaint.text,
-        sentiment=analysis_result["sentiment"],
-        confidence=float(analysis_result["confidence"])
+        sentiment=analysis_result["sentiment"]
     )
     
     # Получение сохраненной записи для ответа
@@ -110,7 +106,6 @@ async def analyze_complaint(complaint: Complaint):
         complaint_id=saved_complaint["complaint_id"],
         text=saved_complaint["text"],
         sentiment=saved_complaint["sentiment"],
-        confidence=saved_complaint["confidence"],
         timestamp=saved_complaint["timestamp"]
     )
 
@@ -121,6 +116,5 @@ async def get_complaint_by_id(complaint_id: int):
         complaint_id=complaint["complaint_id"],
         text=complaint["text"],
         sentiment=complaint["sentiment"],
-        confidence=complaint["confidence"],
         timestamp=complaint["timestamp"]
     )
