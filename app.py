@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 import sqlite3
 import requests
@@ -25,18 +25,24 @@ DATABASE_NAME = "complaints.db"
 
 # Инициализация базы данных
 def init_db():
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS complaints (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL,
-            status TEXT DEFAULT OPEN,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            sentiment TEXT NOT NULL
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS complaints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                status TEXT DEFAULT OPEN,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sentiment TEXT NOT NULL
+            )
+            """)
+            conn.commit()
+    except sqlite3.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database initialization failed: {str(e)}"
         )
-        """)
-        conn.commit()
 
 # Вызов API анализа тональности
 def analyze_sentiment(text: str) -> dict:
@@ -45,76 +51,114 @@ def analyze_sentiment(text: str) -> dict:
         response = requests.post(API_LAYER_URL, headers=headers, data=text.encode("utf-8"))
         response.raise_for_status()
         return response.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Sentiment analysis API error: {str(e)}")
-
+    except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+        print(f"Sentiment analysis API error: {str(e)}")
+        return None
+    
 # Сохранение жалобы в базу данных
 def save_complaint(text: str, sentiment: str) -> int:
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO complaints (text, sentiment) VALUES (?, ?)",
-            (text, sentiment)
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO complaints (text, sentiment) VALUES (?, ?)",
+                (text, sentiment)
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except sqlite3.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save complaint: {str(e)}"
         )
-        conn.commit()
-        return cursor.lastrowid
 
 # Получение жалобы из базы данных
 def get_complaint(complaint_id: int) -> dict:
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, text, sentiment, timestamp FROM complaints WHERE id = ?",
-            (complaint_id,)
-        )
-        result = cursor.fetchone()
-        if not result:
-            raise HTTPException(status_code=404, detail="Complaint not found")
-        return {
-            "complaint_id": result[0],
-            "text": result[1],
-            "sentiment": result[2],
-            "timestamp": result[3]
-        }
+    
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, text, sentiment, timestamp FROM complaints WHERE id = ?",
+                (complaint_id,)
+            )
+            result = cursor.fetchone()
+            if not result:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
+            return {
+                "complaint_id": result[0],
+                "text": result[1],
+                "sentiment": result[2],
+                "timestamp": result[3]
+            }
+    except sqlite3.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )    
 
 @app.on_event("startup")
 async def startup_event():
-    init_db()
+ try:
+        init_db()
+ except HTTPException as e:
+        print(f"Failed to initialize database: {e.detail}")
+        raise e
 
 @app.post("/analyze", response_model=SentimentAnalysisResult)
 async def analyze_complaint(complaint: Complaint):
-    # Анализ тональности
-    analysis_result = analyze_sentiment(complaint.text)
+    try:
+        # Анализ тональности
+        analysis_result = analyze_sentiment(complaint.text)
+        # Если API недоступно, используем значения по умолчанию
+        if analysis_result is None:
+            sentiment = "unknown"
+        else:
+            # Проверка наличия ожидаемых полей в ответе
+            if not all(key in analysis_result for key in ["sentiment"]):
+                sentiment = "unknown"
+                confidence = 0.0
+            else:
+                sentiment = analysis_result["sentiment"]            
     
-    # Проверка наличия ожидаемых полей в ответе
-    if not all(key in analysis_result for key in ["sentiment"]):
-        raise HTTPException(
-            status_code=500,
-            detail="Unexpected response from sentiment analysis API"
+        # Сохранение в базу данных
+        complaint_id = save_complaint(
+            text=complaint.text,
+            sentiment=analysis_result["sentiment"]
         )
     
-    # Сохранение в базу данных
-    complaint_id = save_complaint(
-        text=complaint.text,
-        sentiment=analysis_result["sentiment"]
-    )
+        # Получение сохраненной записи для ответа
+        saved_complaint = get_complaint(complaint_id)
     
-    # Получение сохраненной записи для ответа
-    saved_complaint = get_complaint(complaint_id)
-    
-    return SentimentAnalysisResult(
-        complaint_id=saved_complaint["complaint_id"],
-        text=saved_complaint["text"],
-        sentiment=saved_complaint["sentiment"],
-        timestamp=saved_complaint["timestamp"]
-    )
+        return SentimentAnalysisResult(
+            complaint_id=saved_complaint["complaint_id"],
+            text=saved_complaint["text"],
+            sentiment=saved_complaint["sentiment"],
+            timestamp=saved_complaint["timestamp"]
+        )
+    except HTTPException:
+        # Пробрасываем уже созданные HTTPException
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
 
 @app.get("/complaints/{complaint_id}", response_model=SentimentAnalysisResult)
 async def get_complaint_by_id(complaint_id: int):
-    complaint = get_complaint(complaint_id)
-    return SentimentAnalysisResult(
-        complaint_id=complaint["complaint_id"],
-        text=complaint["text"],
-        sentiment=complaint["sentiment"],
-        timestamp=complaint["timestamp"]
-    )
+    try:
+        complaint = get_complaint(complaint_id)
+        return SentimentAnalysisResult(
+            complaint_id=complaint["complaint_id"],
+            text=complaint["text"],
+            sentiment=complaint["sentiment"],
+            timestamp=complaint["timestamp"]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
